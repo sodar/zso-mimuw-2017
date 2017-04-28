@@ -1,0 +1,101 @@
+#ifndef MONTER_H
+#define MONTER_H
+
+/* PCI ids */
+
+#define MONTER_VENDOR_ID			0x1af4
+#define MONTER_DEVICE_ID			0x10f7
+
+/* Registers */
+
+#define MONTER_ENABLE				0x000
+#define MONTER_ENABLE_CALC			0x00000001
+#define MONTER_ENABLE_FETCH_CMD			0x00000004
+#define MONTER_STATUS				0x004
+#define MONTER_STATUS_CALC			0x00000001
+#define MONTER_STATUS_FIFO			0x00000002
+#define MONTER_STATUS_FETCH_CMD			0x00000004
+#define MONTER_INTR				0x008
+#define MONTER_INTR_NOTIFY			0x00000001
+#define MONTER_INTR_INVALID_CMD			0x00000002
+#define MONTER_INTR_FIFO_OVERFLOW		0x00000004
+#define MONTER_INTR_ENABLE			0x00c
+#define MONTER_RESET				0x010
+#define MONTER_RESET_CALC			0x00000001
+#define MONTER_RESET_FIFO			0x00000002
+#define MONTER_COUNTER				0x014
+#define MONTER_FIFO_SEND			0x018
+#define MONTER_FIFO_FREE			0x01c
+#define MONTER_CMD_READ_PTR			0x020
+#define MONTER_CMD_WRITE_PTR			0x024
+/* Undocumented registers */
+#define MONTER_FIFO_STATE			0x028
+#define MONTER_FIFO_STATE_READ(st)		((st) & 0x3f)
+#define MONTER_FIFO_STATE_WRITE(st)		((st) >> 8 & 0x3f)
+#define MONTER_CALC_STATE_COUNTER		0x02c
+#define MONTER_CALC_STATE_ADDR_AB		0x030
+#define MONTER_CALC_STATE_RUN			0x034
+#define MONTER_CALC_RUN_MULT			0x038
+#define MONTER_CALC_RUN_REDC			0x03c
+#define MONTER_CALC_STATE_PAGE(idx)		(0x040 + (idx) * 4)
+#define MONTER_PAGE_NUM				0x10
+#define MONTER_PAGE_SIZE			0x1000
+#define MONTER_FIFO_CMD(idx)			(0x080 + (idx) * 4)
+#define MONTER_FIFO_CMD_NUM			0x20
+#define MONTER_CALC_STATE_A			0x100
+#define MONTER_CALC_STATE_BD			0x104
+#define MONTER_CALC_STATE_C			0x108
+#define MONTER_CALC_STATE_E			0x10c
+#define MONTER_CALC_STATE_POS			0x110
+#define MONTER_CALC_STATE_POS_MODE(st)		((st) & 0xf)
+#define MONTER_CALC_STATE_POS_MODE_IDLE		0x0
+#define MONTER_CALC_STATE_POS_MODE_MULT		0x1
+#define MONTER_CALC_STATE_POS_MODE_MULT_AC	0x2
+#define MONTER_CALC_STATE_POS_MODE_MULT_ABC	0x3
+#define MONTER_CALC_STATE_POS_MODE_MULT_ACD	0x4
+#define MONTER_CALC_STATE_POS_MODE_MULT_C	0x5
+#define MONTER_CALC_STATE_POS_MODE_REDC		0x6
+#define MONTER_CALC_STATE_POS_MODE_REDC_E	0x7
+#define MONTER_CALC_STATE_POS_MODE_REDC_ACE	0x8
+#define MONTER_CALC_STATE_POS_MODE_REDC_ABCE	0x9
+#define MONTER_CALC_STATE_POS_MODE_REDC_ACDE	0xa
+#define MONTER_CALC_STATE_POS_MODE_REDC_CMP	0xb
+#define MONTER_CALC_STATE_POS_MODE_REDC_CMP_B	0xc
+#define MONTER_CALC_STATE_POS_MODE_REDC_SUB	0xd
+#define MONTER_CALC_STATE_POS_MODE_REDC_SUB_B	0xe
+#define MONTER_CALC_STATE_POS_MODE_REDC_SUB_D	0xf
+#define MONTER_CALC_STATE_POS_CARRY		0x10
+#define MONTER_CALC_STATE_POS_A(st)		((st) >> 5 & 0x1fff)
+#define MONTER_CALC_STATE_POS_B(st)		((st) >> 18 & 0x3fff)
+
+/* Commands */
+
+#define MONTER_CMD_KIND(cmd)			((cmd) & 3)
+#define MONTER_CMD_KIND_JUMP			0
+#define MONTER_CMD_KIND_CONTROL			1
+#define MONTER_CMD_KIND_ADDR_AB			2
+#define MONTER_CMD_KIND_RUN 			3
+#define MONTER_CMD_SUBTYPE(cmd)			((cmd) & 4)
+#define MONTER_CMD_SUBTYPE_CONTROL_PAGE		0x0
+#define MONTER_CMD_SUBTYPE_CONTROL_COUNTER	0x4
+#define MONTER_CMD_SUBTYPE_RUN_MULT		0x0
+#define MONTER_CMD_SUBTYPE_RUN_REDC		0x4
+#define MONTER_CMD_NOTIFY			0x8
+
+#define MONTER_CMD_JUMP(addr)			(MONTER_CMD_KIND_JUMP | addr)
+#define MONTER_CMD_PAGE(idx, addr, notify)	(MONTER_CMD_KIND_CONTROL | MONTER_CMD_SUBTYPE_CONTROL_PAGE | (notify) << 3 | (idx) << 8 | (addr))
+#define MONTER_CMD_COUNTER(ctr, notify)		(MONTER_CMD_KIND_CONTROL | MONTER_CMD_SUBTYPE_CONTROL_COUNTER | (notify) << 3 | (ctr) << 8)
+#define MONTER_CMD_ADDR_AB(a, b, notify)	(MONTER_CMD_KIND_ADDR_AB | (notify) << 3 | ((a) >> 2) << 4 | ((b) >> 2) << 18)
+#define MONTER_CMD_RUN_MULT(sz, d, notify)		(MONTER_CMD_KIND_RUN | MONTER_CMD_SUBTYPE_RUN_MULT | (notify) << 3 | ((sz) - 1) << 4 | ((d) >> 2) << 18)
+#define MONTER_CMD_RUN_REDC(sz, d, notify)		(MONTER_CMD_KIND_RUN | MONTER_CMD_SUBTYPE_RUN_REDC | (notify) << 3 | ((sz) - 1) << 4 | ((d) >> 2) << 18)
+
+#define MONTER_CMD_JUMP_TARGET(cmd)	((cmd) & 0xfffffffc)
+#define MONTER_CMD_PAGE_IDX(cmd)	((cmd) >> 8 & 0xf)
+#define MONTER_CMD_PAGE_ADDR(cmd)	((cmd) & 0xfffff000)
+#define MONTER_CMD_COUNTER_VALUE(cmd)	((cmd) >> 8 & 0xffffff)
+#define MONTER_CMD_ADDR_A(cmd)		(((cmd) >> 4 & 0x3fff) << 2)
+#define MONTER_CMD_ADDR_B(cmd)		(((cmd) >> 18 & 0x3fff) << 2)
+#define MONTER_CMD_RUN_SIZE(cmd)	(((cmd) >> 4 & 0x3fff) + 1)
+#define MONTER_CMD_ADDR_D(cmd)		(((cmd) >> 18 & 0x3fff) << 2)
+
+#endif
