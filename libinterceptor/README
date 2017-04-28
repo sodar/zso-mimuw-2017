@@ -1,0 +1,47 @@
+Zaawansowane Systemy Operacjne
+rok akademicki 2016/2017
+
+Zadanie 1: ELF
+Autor rozwiązania: Dariusz Sosnowski <ds384373@students.mimuw.edu.pl>
+
+## Opis rozwiązania
+
+Rozwiązanie iteruje po liście załadowanych obiektów (przy użyciu funkcji `dl_iterate_phdr` oraz
+callbacka `handle_relocation_entries`), szukając w każdym z nich nagłówka programu
+o typie `DYNAMIC`.
+
+Korzystając ze znalezionego nagłówka programu program znajduje tablicę relokacji i szuka
+w niej relokacji typu `R_X86_64_JUMP_SLOT` skojarzonej z funkcją podaną w parametrze do
+`intercept_function`/`unintercept_function`.
+Jeżeli odpowiedni wpis zostanie odnaleziony, program przechodzi o poszukiwania oryginalnej funkcji
+do której odwołuje się dana relokacja:
+
+* Proces ten również wykorzystuje `dl_iterate_phdr` ale z innym callbackiem - `rel_symbol_finder`
+* `rel_symbol_finder` dla każdego obiektu dzielonego przeszukuje jego tablicę
+  symboli w poszukiwaniu wpisu poprawnie definiującego szukaną funkcję (tj. wpis w tablicy
+  symboli ma widoczność różną od STT_LOCAL, definiuje funkcję oraz posiada zdefiniowany
+  indeks nagłówka sekcji).
+	* Przeszukiwana tablica symboli znajduje się w sekcji `.dynsym`, a jej adres pobierany jest
+	  z segmentu `DT_SYMTAB`.
+* `rel_symbol_finder` zwraca poprzez strukturę typu `rel_symbol_result` adres do oryginalnej
+  funkcji, który został wyliczony na podstawie adresu bazowego obiektu który go definiuje
+  oraz offsecie zapisanym w tablicy symboli:
+
+    original_func = info->dlpi_addr + sym->st_value
+
+  * W przypadku symboli typu `STT_IFUNC` powyższe wyliczenie wskazuje na funkcję R, która zwraca
+    adres oryginalej funkcji. Wtedy `original_func` jest ustalone jako wartość zwrócona przez R.
+* Jeżeli `rel_symbol_finder` nie znalazł poprawnego wpisu, to cały proces kończy się błędem.
+
+Po znalezieniu oryginalnej funkcji zostaje zmodyfikowany wpis w GOT w aktualnie obsługiwanym
+obiekcie dzielonym. W zależności od wywołanej funkcji (`intercept_function` albo
+`unintercept_function`) zostaje tam wpisany adres nowej funkcji albo przywrócony adres
+starej funkcji.
+
+Adres oryginalnej funkcji jest przechowywany dla dalszych iteracji funkcją
+`handle_relocation_entries`, dzięki czemu poszukiwanie symbolu jest dokonywane co najwyżej raz.
+
+Modyfikowane są wszystkie wpisy GOT dla każdego załadowanego obiektu dzielonego (tj. gdy
+główny plik wykonywalny używa funkcji `printf` oraz jej zależność też używa `printf` poprzez PLT
+to przekierowanie zostanie wykonane dla obu z nich).
+
