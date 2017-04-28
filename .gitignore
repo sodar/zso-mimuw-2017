@@ -1,0 +1,10 @@
+# .gitignore
+
+# Vim
+*.swp
+*.swo
+
+# Object files
+*.a
+*.ko
+*.o
