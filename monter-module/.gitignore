@@ -1,0 +1,12 @@
+# .gitignore
+
+# Vim
+*.swp
+*.swo
+
+# Object files
+*.o
+*.ko
+*.o.cmd
+*.ko.cmd
+*.symvers
