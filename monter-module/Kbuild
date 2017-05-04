@@ -1,1 +1,2 @@
 obj-m := monter.o
+ccflags-y += -g -DDEBUG
