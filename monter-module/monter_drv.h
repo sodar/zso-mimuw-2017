@@ -4,20 +4,25 @@
 #include <linux/cdev.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/types.h>
 
-#define DRIVER_NAME "monter"
-#define MAX_DEVICES (256)
+#include "monter.h"
+#include "monter_ioctl.h"
 
-#define DRIVER_PAGE_SIZE	(4096)
-#define DRIVER_CTX_MAX_SIZE	(16 * DRIVER_PAGE_SIZE)
+#define MONTER_NAME		"monter"
+#define MONTER_MEM_SIZE		(MONTER_PAGE_NUM * MONTER_PAGE_SIZE)
+#define MONTER_MAX_DEVICES	(256)
+#define MONTER_MMIO_SIZE	(4096)
 
-#define MONTER_DMA_SIZE		(16 * DRIVER_PAGE_SIZE)
+#define MONTER_SWCMD_TYPE_INVALID	(0xf)
 
-#define INDEX_CLAIM_FAILED MAX_DEVICES
+#define INDEX_CLAIM_FAILED MONTER_MAX_DEVICES
 
 /*
 NOTE(sodar):
+podstawowe rozwiązanie - synchroniczne, bez DMA dla poleceń
+- polecenia wykonywane w trakcie write()
 */
 struct monter_device_context {
 	struct pci_dev *pdev;
@@ -25,6 +30,12 @@ struct monter_device_context {
 	unsigned int entry_index;
 	struct cdev cdev;
 	dev_t devt;
+	struct device *device;
+
+	/* Fields used with synchronous approach */
+	struct mutex dev_access_lock;
+	struct file *current_filp;
+	u32 counter;
 };
 
 struct monter_device_context_entry {
@@ -65,32 +76,17 @@ struct monter_context {
 	size_t size;
 	void *data;
 	dma_addr_t dma_handle;
-	spinlock_t queue_lock;
-	struct list_head command_queue;
+
+	/* Used to validate RUN_MULT and RUN_REDC commands */
+	unsigned int last_cmd_type;
+	u32 last_addr_a;
+	u32 last_addr_b;
 };
 
 #define CTX_INITIALIZED(ctx) ((ctx)->size > 0)
 
-static inline void
-MONTER_CTX_LOCK_INIT(struct monter_context *ctx)
-{
-	spin_lock_init(&ctx->queue_lock);
-}
-
-static inline void
-MONTER_CTX_LOCK(struct monter_context *ctx)
-{
-	spin_lock(&ctx->queue_lock);
-}
-
-static inline void
-MONTER_CTX_UNLOCK(struct monter_context *ctx)
-{
-	spin_unlock(&ctx->queue_lock);
-}
-
 /*
- * Register manipulation functions
+ * Registers manipulation functions
  */
 
 /** Read ENABLE register */
