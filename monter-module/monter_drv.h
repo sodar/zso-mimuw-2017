@@ -11,9 +11,9 @@
 #include "monter_ioctl.h"
 
 #define MONTER_NAME		"monter"
-#define MONTER_MEM_SIZE		(MONTER_PAGE_NUM * MONTER_PAGE_SIZE)
 #define MONTER_MAX_DEVICES	(256)
 #define MONTER_MMIO_SIZE	(4096)
+#define MONTER_MEM_SIZE		(MONTER_PAGE_NUM * MONTER_PAGE_SIZE)
 
 #define MONTER_SWCMD_TYPE_INVALID	(0xf)
 
@@ -78,7 +78,7 @@ struct monter_context {
 	dma_addr_t dma_handle;
 
 	/* Used to validate RUN_MULT and RUN_REDC commands */
-	unsigned int last_cmd_type;
+	unsigned int first_cmd_type;
 	u32 last_addr_a;
 	u32 last_addr_b;
 };

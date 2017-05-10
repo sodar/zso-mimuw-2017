@@ -243,7 +243,7 @@ command_create(struct monter_context *ctx, u32 cmd)
 		/* 17b should be cleared */
 		if (unlikely(cmd & (1 << 17)))
 			return ERR_PTR(-EINVAL);
-		if (ctx->last_cmd_type != MONTER_SWCMD_TYPE_ADDR_AB)
+		if (ctx->first_cmd_type != MONTER_SWCMD_TYPE_ADDR_AB)
 			return ERR_PTR(-EINVAL);
 		return __command_run_mult_create(ctx, cmd);
 
@@ -251,7 +251,7 @@ command_create(struct monter_context *ctx, u32 cmd)
 		/* 17b should be cleared */
 		if (unlikely(cmd & (1 << 17)))
 			return ERR_PTR(-EINVAL);
-		if (ctx->last_cmd_type != MONTER_SWCMD_TYPE_ADDR_AB)
+		if (ctx->first_cmd_type != MONTER_SWCMD_TYPE_ADDR_AB)
 			return ERR_PTR(-EINVAL);
 		return __command_run_redc_create(ctx, cmd);
 
@@ -369,7 +369,9 @@ monter_fops_write(struct file *filp, const char __user *input,
 			err = PTR_ERR(cmd_object);
 			goto failure;
 		}
-		ctx->last_cmd_type = cmd_object->type;
+		if (ctx->first_cmd_type == MONTER_SWCMD_TYPE_INVALID) {
+			ctx->first_cmd_type = cmd_object->type;
+		}
 		list_add_tail(&cmd_object->entry, &cmd_queue);
 	}
 
@@ -508,7 +510,7 @@ monter_fops_open(struct inode *inode, struct file *filp)
 
 	entry_index = iminor(inode);
 	ctx->dev_ctx = &monter_entries[entry_index].dev_ctx;
-	ctx->last_cmd_type = MONTER_SWCMD_TYPE_INVALID;
+	ctx->first_cmd_type = MONTER_SWCMD_TYPE_INVALID;
 
 	filp->private_data = ctx;
 
@@ -700,7 +702,7 @@ static struct pci_driver monter_pci_driver = {
 	.remove = monter_pci_remove,
 };
 
-static int __init monter_init_module(void)
+static int __init monter_init(void)
 {
 	int ret;
 
@@ -725,7 +727,7 @@ static int __init monter_init_module(void)
 	return 0;
 }
 
-static void __exit monter_exit_module(void)
+static void __exit monter_exit(void)
 {
 	pci_unregister_driver(&monter_pci_driver);
 
@@ -736,5 +738,5 @@ static void __exit monter_exit_module(void)
 		unregister_chrdev_region(monter_dev_numbers, MONTER_MAX_DEVICES);
 }
 
-module_init(monter_init_module);
-module_exit(monter_exit_module);
+module_init(monter_init);
+module_exit(monter_exit);
