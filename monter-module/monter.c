@@ -566,14 +566,6 @@ monter_ctx_work_handler(struct work_struct *work)
 
 	list_init(&work_cmd_queue);
 
-	/* In the single work driver expects to issue a maximum of 32 commands */
-	page_cmd_count = prepare_page_cmd(ctx, page_cmd, ARRAY_SIZE(page_cmd));
-	BUG_ON(page_cmd_count == 0 || page_cmd_count > 16);
-
-	/* PAGE commands, one COUNTER commands, one last ADDR_AB */
-	available_cmd = 32 - page_cmd_count - 2;
-
-	/* Take maximum amount of commands to push to queue */
 	mutex_lock(&ctx->cmd_queue_lock);
 	if (list_empty(&ctx->cmd_queue)) {
 		mutex_unlock(&ctx->cmd_queue_lock);
@@ -581,6 +573,33 @@ monter_ctx_work_handler(struct work_struct *work)
 		wake_up_interruptible(&ctx->dctx->fsync_queue);
 		return;
 	}
+	mutex_unlock(&ctx->cmd_queue_lock);
+
+	/* In the single work driver expects to issue a maximum of 32 commands */
+	page_cmd_count = prepare_page_cmd(ctx, page_cmd, ARRAY_SIZE(page_cmd));
+	BUG_ON(page_cmd_count == 0 || page_cmd_count > 16);
+
+	/* Ensure that monter CALC is set to 1 */
+	enable_reg = __monter_reg_enable_read(ctx->dctx);
+	enable_reg |= MONTER_ENABLE_CALC;
+	__monter_reg_enable_write(ctx->dctx, enable_reg);
+
+	/* Set notify flag to 0 */
+	atomic_set(&ctx->dctx->notify, 0);
+
+	/* Push PAGE commands*/
+	for (i = 0; i < page_cmd_count; ++i)
+		__monter_reg_fifo_send_write(ctx->dctx, page_cmd[i].cmd);
+	__monter_reg_fifo_send_write(ctx->dctx, MONTER_CMD_COUNTER(0, 1));
+
+	wait_event(ctx->dctx->notify_queue, atomic_read(&ctx->dctx->notify) == 1);
+	atomic_set(&ctx->dctx->notify, 0);
+
+	/* 32 but one COUNTER commands and one last ADDR_AB */
+	available_cmd = 30;
+
+	/* Take maximum amount of commands to push to queue */
+	mutex_lock(&ctx->cmd_queue_lock);
 	list_for_each_entry_safe(cmd, next_cmd, &ctx->cmd_queue, list_entry) {
 		if (available_cmd == 0)
 			break;
@@ -593,15 +612,6 @@ monter_ctx_work_handler(struct work_struct *work)
 	/* Set notify flag to 0 */
 	atomic_set(&ctx->dctx->notify, 0);
 
-	/* Ensure that monter CALC is set to 1 */
-	enable_reg = __monter_reg_enable_read(ctx->dctx);
-	enable_reg |= MONTER_ENABLE_CALC;
-	__monter_reg_enable_write(ctx->dctx, enable_reg);
-
-	/* Push PAGE commands*/
-	for (i = 0; i < page_cmd_count; ++i)
-		__monter_reg_fifo_send_write(ctx->dctx, page_cmd[i].cmd);
-	
 	/* One last ADDR_AB (if any) */
 	if (ctx->last_issued_addr_ab)
 		__monter_reg_fifo_send_write(ctx->dctx, ctx->last_issued_addr_ab);
@@ -621,6 +631,7 @@ monter_ctx_work_handler(struct work_struct *work)
 	__monter_reg_fifo_send_write(ctx->dctx, MONTER_CMD_COUNTER(last_index, 1));
 
 	wait_event(ctx->dctx->notify_queue, atomic_read(&ctx->dctx->notify) == 1);
+	atomic_set(&ctx->dctx->notify, 0);
 
 	counter_reg = __monter_reg_counter_read(ctx->dctx);
 	atomic_set(&ctx->last_run_index, counter_reg);
