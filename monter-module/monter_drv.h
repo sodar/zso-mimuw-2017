@@ -10,6 +10,8 @@
 #include "monter.h"
 #include "monter_ioctl.h"
 
+#define list_init(L) (INIT_LIST_HEAD(L))
+
 #define MONTER_NAME		"monter"
 #define MONTER_MEM_SIZE		(MONTER_PAGE_NUM * MONTER_PAGE_SIZE)
 #define MONTER_MMIO_SIZE	(4096)
@@ -24,11 +26,12 @@
 
 #define INDEX_CLAIM_FAILED	MONTER_MAX_DEVICES
 
-/*
-NOTE(sodar):
-podstawowe rozwiązanie - synchroniczne, bez DMA dla poleceń
-- polecenia wykonywane w trakcie write()
-*/
+#ifdef DEBUG
+#	define PDEBUG(args...) printk(args)
+#else
+#	define PDEBUG(args...)
+#endif
+
 struct monter_device_context {
 	unsigned int device_index;
 	struct {
@@ -50,23 +53,22 @@ struct monter_device_context {
 	struct mutex dev_access_lock;
 	wait_queue_head_t notify_queue;
 	atomic_t notify;
+	wait_queue_head_t fsync_queue;
 	struct tasklet_struct notify_tasklet;
+
+	/* Device work queue */
+	struct workqueue_struct *dev_workqueue;
+
+	/* Command indices */
+	spinlock_t index_lock;
+	uint32_t index;
 };
 
 struct monter_device_context_entry {
-	struct monter_device_context dev_ctx;
+	struct monter_device_context *dev_ctx;
 	bool taken;
 };
 
-/**
- * monter_context - device context allocated per each "file" opened
- *
- * @dev_ctx: pointer to associated device context
- * @size: amount of bytes in @data work-buffer
- * @data: pointer to work-buffer
- * @queue_lock: lock which has to be acquired before a thread wants to modify a @command_queue
- * @command_queue: head of the command queue
- */
 struct monter_context {
 	struct monter_device_context *dctx;
 	size_t size;
@@ -77,6 +79,24 @@ struct monter_context {
 	bool addr_ab_issued;
 	uint32_t last_addr_a;
 	uint32_t last_addr_b;
+
+	/* Context's command queue */
+	struct mutex cmd_queue_lock;
+	struct list_head cmd_queue;
+	uint32_t last_index;
+	atomic_t last_run_index;
+
+	/* Remember last sent ADDR_AB to the device */
+	uint32_t last_issued_addr_ab;
+
+	/* Work struct for this context */
+	struct work_struct cmd_work;
+};
+
+struct monter_command {
+	uint32_t index;
+	uint32_t cmd;
+	struct list_head list_entry;
 };
 
 #define CTX_INITIALIZED(ctx) ((ctx)->size > 0)
