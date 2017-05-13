@@ -17,6 +17,10 @@
 #define MONTER_MMIO_SIZE	(4096)
 #define MONTER_MAX_DEVICES	(256)
 
+#define MONTER_CMD_BUFFER_SIZE	(4096)
+#define MONTER_CMD_BUFFER_NUM	(MONTER_CMD_BUFFER_SIZE / 4)
+#define MONTER_CMD_BUFFER_BATCH	(128)
+
 #define MONTER_CMD_TYPE_INVALID		(0xf)
 #define MONTER_CMD_TYPE_ADDR_AB		(MONTER_CMD_KIND_ADDR_AB)
 #define MONTER_CMD_TYPE_RUN_MULT	(MONTER_CMD_KIND_RUN | MONTER_CMD_SUBTYPE_RUN_MULT)
@@ -62,6 +66,14 @@ struct monter_device_context {
 	/* Command indices */
 	spinlock_t index_lock;
 	uint32_t index;
+
+	/* DMA commands buffer */
+	struct mutex cmd_buffer_lock;
+	wait_queue_head_t cmd_buffer_waitqueue;
+	uint32_t *cmd_buffer;
+	dma_addr_t cmd_buffer_dma;
+	uint32_t cmd_buffer_wr_index;
+	atomic_t cmd_buffer_rd_index;
 };
 
 struct monter_device_context_entry {
@@ -175,7 +187,32 @@ __monter_reg_counter_read(struct monter_device_context *ctx)
 	return ioread32(ctx->bar0 + MONTER_COUNTER);
 }
 
-/* TODO(sodar): CMD_READ_PTR functions */
-/* TODO(sodar): CMD_WRITE_PTR functions */
+/** Read CMD_READ_PTR register */
+static inline uint32_t
+__monter_reg_cmd_read_ptr_read(struct monter_device_context *ctx)
+{
+	return ioread32(ctx->bar0 + MONTER_CMD_READ_PTR);
+}
+
+/** Send value to CMD_READ_PTR register */
+static inline void
+__monter_reg_cmd_read_ptr_write(struct monter_device_context *ctx, uint32_t value)
+{
+	iowrite32(value, ctx->bar0 + MONTER_CMD_READ_PTR);
+}
+
+/** Read CMD_WRITE_PTR register */
+static inline uint32_t
+__monter_reg_cmd_write_ptr_read(struct monter_device_context *ctx)
+{
+	return ioread32(ctx->bar0 + MONTER_CMD_WRITE_PTR);
+}
+
+/** Send value to CMD_WRITE_PTR register */
+static inline void
+__monter_reg_cmd_write_ptr_write(struct monter_device_context *ctx, uint32_t value)
+{
+	iowrite32(value, ctx->bar0 + MONTER_CMD_WRITE_PTR);
+}
 
 #endif // _MONTER_DRV_H_
