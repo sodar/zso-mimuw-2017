@@ -29,13 +29,14 @@ static bool monter_pci_driver_registered;
 static struct monter_device_context_entry monter_entries[MONTER_MAX_DEVICES];
 static DEFINE_SPINLOCK(monter_entries_lock);
 
-static void monter_ctx_work_handler(struct work_struct *work);
+static void monter_work_handler(struct work_struct *work);
 static void monter_tasklet_handler(unsigned long data);
 
 static void
 release_device_context(struct monter_device_context *dctx)
 {
 	BUG_ON(dctx == NULL);
+	BUG_ON(dctx->device_index >= MONTER_MAX_DEVICES);
 
 	spin_lock(&monter_entries_lock);
 	monter_entries[dctx->device_index].taken = false;
@@ -84,15 +85,12 @@ claim_device_context(void)
 		init_waitqueue_head(&dctx->notify_queue);
 		atomic_set(&dctx->notify, 0);
 		init_waitqueue_head(&dctx->fsync_queue);
-
-		tasklet_init(&dctx->notify_tasklet, monter_tasklet_handler,
-			     (unsigned long)dctx);
+		tasklet_init(&dctx->notify_tasklet, monter_tasklet_handler, (unsigned long)dctx);
 
 		spin_lock_init(&dctx->index_lock);
-		dctx->index = 1;
+		dctx->index = 0;
 
 		mutex_init(&dctx->cmd_buffer_lock);
-		init_waitqueue_head(&dctx->cmd_buffer_waitqueue);
 
 		dctx->dev_workqueue = create_singlethread_workqueue(MONTER_NAME);
 		if (dctx->dev_workqueue == NULL)
@@ -115,21 +113,6 @@ minor_to_device(unsigned int minor)
 
 	BUG_ON(!monter_entries[minor].taken);
 	return dctx;
-}
-
-static uint32_t
-fetch_and_incr_command_index(struct monter_device_context *dctx)
-{
-	uint32_t index;
-
-	spin_lock(&dctx->index_lock);
-	index = dctx->index;
-	dctx->index = (dctx->index + 1) % (1 << 24);
-	if (dctx->index == 0)
-		dctx->index += 1;
-	spin_unlock(&dctx->index_lock);
-
-	return index;
 }
 
 static void
@@ -164,28 +147,6 @@ monter_dev_reset(struct monter_device_context *ctx)
 	/* Reset device */
 	__monter_reg_reset_write(ctx, MONTER_RESET_FIFO | MONTER_RESET_CALC);
 }
-
-#if 0
-static int
-monter_set_paging(struct monter_context *ctx)
-{
-	struct monter_device_context *dctx = ctx->dctx;
-	size_t pages;
-	uint32_t bus_addr;
-	uint32_t cmd;
-	unsigned int i;
-
-	pages = ctx->size / MONTER_PAGE_SIZE;
-	bus_addr = ctx->handle & 0xffffffffULL;
-
-	for (i = 0; i < pages; ++i, bus_addr += MONTER_PAGE_SIZE) {
-		cmd = MONTER_CMD_PAGE(i, bus_addr, 0);
-		__monter_reg_fifo_send_write(dctx, cmd);
-	}
-
-	return 0;
-}
-#endif
 
 static size_t
 prepare_page_cmd(struct monter_context *ctx,
@@ -362,16 +323,10 @@ monter_fops_write(struct file *filp, const char __user *input,
 	if (ret)
 		goto fail;
 
-	list_for_each_entry(cmd, &command_list, list_entry) {
-		cmd->index = fetch_and_incr_command_index(ctx->dctx);
-	}
-
 	ret = mutex_lock_interruptible(&ctx->cmd_queue_lock);
 	if (ret < 0)
 		goto fail;
-
 	list_for_each_entry(cmd, &command_list, list_entry) {
-		ctx->last_index = cmd->index;
 		if (MONTER_CMD_KIND(cmd->cmd) == MONTER_CMD_KIND_ADDR_AB) {
 			ctx->addr_ab_issued = true;
 			ctx->last_addr_a = MONTER_CMD_ADDR_A(cmd->cmd);
@@ -379,13 +334,9 @@ monter_fops_write(struct file *filp, const char __user *input,
 		}
 	}
 	list_splice_tail(&command_list, &ctx->cmd_queue);
-
+	atomic_set(&ctx->cmd_queue_empty, 0);
 	mutex_unlock(&ctx->cmd_queue_lock);
-
-	if (!work_pending(&ctx->cmd_work)) {
-		queue_work(ctx->dctx->dev_workqueue, &ctx->cmd_work);
-	}
-
+	queue_work(ctx->dctx->dev_workqueue, &ctx->cmd_work);
 	return count;
 
 fail:
@@ -484,11 +435,10 @@ monter_fops_open(struct inode *inode, struct file *filp)
 
 	mutex_init(&ctx->cmd_queue_lock);
 	list_init(&ctx->cmd_queue);
-	ctx->last_index = 0;
-	atomic_set(&ctx->last_run_index, 0);
+	atomic_set(&ctx->cmd_queue_empty, 1);
 	ctx->last_issued_addr_ab = 0;
 
-	INIT_WORK(&ctx->cmd_work, monter_ctx_work_handler);
+	INIT_WORK(&ctx->cmd_work, monter_work_handler);
 
 	filp->private_data = ctx;
 
@@ -511,14 +461,14 @@ monter_fops_release(struct inode *inode, struct file *filp)
 	dctx = ctx->dctx;
 	pdev = dctx->pdev;
 
-	cancel_work_sync(&ctx->cmd_work);
-
 	mutex_lock(&ctx->cmd_queue_lock);
 	list_for_each_entry_safe(cmd, next_cmd, &ctx->cmd_queue, list_entry) {
 		list_del(&cmd->list_entry);
 		kfree(cmd);
 	}
 	mutex_unlock(&ctx->cmd_queue_lock);
+
+	cancel_work_sync(&ctx->cmd_work);
 
 	if (ctx->data)
 		dma_free_coherent(&pdev->dev, ctx->size, ctx->data, ctx->handle);
@@ -532,14 +482,35 @@ static int
 monter_fops_fsync(struct file *filp, loff_t off1, loff_t off2, int datasync)
 {
 	struct monter_context *ctx = filp->private_data;
+	struct monter_command *cmd;
 	int ret;
 
-	ret = wait_event_interruptible(ctx->dctx->fsync_queue,
-				       atomic_read(&ctx->last_run_index) == ctx->last_index);
+	cmd = kzalloc(sizeof(*cmd), GFP_KERNEL);
+	if (cmd == NULL) {
+		ret = -EINVAL;
+		goto fail;
+	}
+
+	cmd->cmd = MONTER_CMD_COUNTER(0, 0);
+
+	ret = mutex_lock_interruptible(&ctx->cmd_queue_lock);
 	if (ret < 0)
-		return ret;
+		goto fail;
+	list_add_tail(&cmd->list_entry, &ctx->cmd_queue);
+	atomic_set(&ctx->cmd_queue_empty, 0);
+	mutex_unlock(&ctx->cmd_queue_lock);
+	queue_work(ctx->dctx->dev_workqueue, &ctx->cmd_work);
+
+	ret = wait_event_interruptible(ctx->dctx->fsync_queue, atomic_read(&ctx->cmd_queue_empty));
+	if (ret < 0)
+		goto fail;
 
 	return 0;
+
+fail:
+	if (cmd)
+		kfree(cmd);
+	return ret;
 }
 
 static struct file_operations monter_fops = {
@@ -553,76 +524,57 @@ static struct file_operations monter_fops = {
 };
 
 static void
-monter_ctx_work_handler(struct work_struct *work)
+monter_work_handler(struct work_struct *work)
 {
 	struct monter_context *ctx = container_of(work, struct monter_context, cmd_work);
 	struct monter_device_context *dctx = ctx->dctx;
 	uint32_t prepared_cmd[MONTER_CMD_BUFFER_BATCH];
-	size_t prepared_cmd_count;
-	size_t available_cmd;
+	size_t prepared;
 
 	struct monter_command *cmd;
 	struct monter_command *next_cmd;
 
 	uint32_t enable_reg;
-	uint32_t last_index = 0;
-	uint32_t counter_reg;
 	uint32_t new_cmd_write_ptr;
 	unsigned int i;
-	unsigned int j;
 
 	/* Prepare PAGE commands */
-	prepared_cmd_count = prepare_page_cmd(ctx, prepared_cmd, ARRAY_SIZE(prepared_cmd));
-	BUG_ON(prepared_cmd_count == 0 || prepared_cmd_count > 16);
+	prepared = prepare_page_cmd(ctx, prepared_cmd, ARRAY_SIZE(prepared_cmd));
+	BUG_ON(prepared == 0 || prepared > 16);
 
-	available_cmd = ARRAY_SIZE(prepared_cmd) - prepared_cmd_count - 1;
-	i = prepared_cmd_count;
-
-	if (ctx->last_issued_addr_ab) {
-		prepared_cmd[i] = ctx->last_issued_addr_ab;
-		i++;
-		available_cmd--;
-	}
+	if (ctx->last_issued_addr_ab)
+		prepared_cmd[prepared++] = ctx->last_issued_addr_ab;
 
 	mutex_lock(&ctx->cmd_queue_lock);
 	if (list_empty(&ctx->cmd_queue)) {
+		atomic_set(&ctx->cmd_queue_empty, 1);
 		mutex_unlock(&ctx->cmd_queue_lock);
-		atomic_set(&ctx->last_run_index, ctx->last_index);
 		wake_up_interruptible(&dctx->fsync_queue);
 		return;
 	}
 	list_for_each_entry_safe(cmd, next_cmd, &ctx->cmd_queue, list_entry) {
-		if (available_cmd == 0)
+		if (prepared >= ARRAY_SIZE(prepared_cmd) - 1) // additional COUNTER
 			break;
 
 		if (MONTER_CMD_KIND(cmd->cmd) == MONTER_CMD_KIND_ADDR_AB) {
 			ctx->last_issued_addr_ab = cmd->cmd;
 		}
-		prepared_cmd[i] = cmd->cmd;
-		last_index = cmd->index;
+		prepared_cmd[prepared++] = cmd->cmd;
 		list_del(&cmd->list_entry);
 		kfree(cmd);
-
-		i++;
-		available_cmd--;
 	}
 	mutex_unlock(&ctx->cmd_queue_lock);
 
 	/* Put COUNTER command in the last spot */
-	BUG_ON(i >= ARRAY_SIZE(prepared_cmd));
-	prepared_cmd[i] = MONTER_CMD_COUNTER(last_index, 1);
-	i++;
-
-	prepared_cmd_count = i;
+	BUG_ON(prepared >= ARRAY_SIZE(prepared_cmd));
+	prepared_cmd[prepared++] = MONTER_CMD_COUNTER(0, 1);
 
 	mutex_lock(&dctx->cmd_buffer_lock);
-	if (dctx->cmd_buffer_wr_index + prepared_cmd_count >= MONTER_CMD_BUFFER_NUM) {
-		wait_event(dctx->cmd_buffer_waitqueue,
-			   dctx->cmd_buffer_wr_index == atomic_read(&dctx->cmd_buffer_rd_index));
-		dctx->cmd_buffer_wr_index = 0;
-		atomic_set(&dctx->cmd_buffer_rd_index, 0);
 
-		/* Disable FETCH_CMD */
+	if (dctx->cmd_buffer_wr_index + prepared >= MONTER_CMD_BUFFER_NUM) {
+		BUG_ON(__monter_reg_status_read(dctx) & MONTER_STATUS_FETCH_CMD);
+		dctx->cmd_buffer_wr_index = 0;
+
 		enable_reg = __monter_reg_enable_read(dctx);
 		enable_reg &= (~MONTER_ENABLE_FETCH_CMD);
 		__monter_reg_enable_write(dctx, enable_reg);
@@ -634,39 +586,26 @@ monter_ctx_work_handler(struct work_struct *work)
 		enable_reg |= MONTER_ENABLE_FETCH_CMD;
 		__monter_reg_enable_write(dctx, enable_reg);
 	}
-	atomic_set(&dctx->notify, 0);
-	for (i = 0, j = dctx->cmd_buffer_wr_index; i < prepared_cmd_count; ++i, ++j) {
-		dctx->cmd_buffer[j] = prepared_cmd[i];
+
+	for (i = 0;
+	     i < prepared;
+	     ++i, ++dctx->cmd_buffer_wr_index) {
+		dctx->cmd_buffer[dctx->cmd_buffer_wr_index] = prepared_cmd[i];
 	}
-	dctx->cmd_buffer_wr_index = j;
 	new_cmd_write_ptr = dctx->cmd_buffer_dma + dctx->cmd_buffer_wr_index * 4;
+	atomic_set(&dctx->notify, 0);
 	__monter_reg_cmd_write_ptr_write(dctx, new_cmd_write_ptr);
+
 	mutex_unlock(&dctx->cmd_buffer_lock);
 
 	wait_event(dctx->notify_queue, atomic_read(&dctx->notify) == 1);
-	atomic_set(&dctx->notify, 0);
-
-	counter_reg = __monter_reg_counter_read(ctx->dctx);
-	atomic_set(&ctx->last_run_index, counter_reg);
-
-	mutex_lock(&ctx->cmd_queue_lock);
-	if (list_empty(&ctx->cmd_queue)) {
-		wake_up_interruptible(&dctx->fsync_queue);
-	} else {
-		queue_work(dctx->dev_workqueue, &ctx->cmd_work);
-	}
-	mutex_unlock(&ctx->cmd_queue_lock);
+	queue_work(dctx->dev_workqueue, &ctx->cmd_work);
 }
 
 static void
 monter_tasklet_handler(unsigned long data)
 {
 	struct monter_device_context *dctx = (struct monter_device_context *)data;
-	uint32_t read_ptr = __monter_reg_cmd_read_ptr_read(dctx);
-	uint32_t read_index = (read_ptr - dctx->cmd_buffer_dma) / 4;
-
-	atomic_set(&dctx->cmd_buffer_rd_index, read_index);
-	wake_up(&dctx->cmd_buffer_waitqueue);
 
 	atomic_set(&dctx->notify, 1);
 	wake_up(&dctx->notify_queue);
@@ -682,11 +621,8 @@ monter_irq_handler(int irq, void *data)
 	if (!intr)
 		return IRQ_NONE;
 
-	if (intr & MONTER_INTR_NOTIFY) {
-		tasklet_schedule(&dctx->notify_tasklet);
-	}
-
 	__monter_reg_intr_write(dctx, intr);
+	tasklet_schedule(&dctx->notify_tasklet);
 
 	return IRQ_HANDLED;
 }
@@ -776,7 +712,6 @@ monter_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		goto fail;
 	}
 	dctx->cmd_buffer_wr_index = 0;
-	atomic_set(&dctx->cmd_buffer_rd_index, 0);
 
 	/* Register IRQ handler for this device */
 	ret = request_irq(pdev->irq, monter_irq_handler, IRQF_SHARED, MONTER_NAME, dctx);
@@ -811,6 +746,8 @@ monter_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	}
 
 	pci_set_drvdata(pdev, dctx);
+
+	printk(KERN_INFO "%s: /dev/monter%u attached\n", MONTER_NAME, dctx->device_index);
 
 	return 0;
 

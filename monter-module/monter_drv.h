@@ -60,20 +60,18 @@ struct monter_device_context {
 	wait_queue_head_t fsync_queue;
 	struct tasklet_struct notify_tasklet;
 
-	/* Device work queue */
-	struct workqueue_struct *dev_workqueue;
-
 	/* Command indices */
 	spinlock_t index_lock;
 	uint32_t index;
 
 	/* DMA commands buffer */
 	struct mutex cmd_buffer_lock;
-	wait_queue_head_t cmd_buffer_waitqueue;
 	uint32_t *cmd_buffer;
 	dma_addr_t cmd_buffer_dma;
 	uint32_t cmd_buffer_wr_index;
-	atomic_t cmd_buffer_rd_index;
+
+	/* Device work queue */
+	struct workqueue_struct *dev_workqueue;
 };
 
 struct monter_device_context_entry {
@@ -95,8 +93,7 @@ struct monter_context {
 	/* Context's command queue */
 	struct mutex cmd_queue_lock;
 	struct list_head cmd_queue;
-	uint32_t last_index;
-	atomic_t last_run_index;
+	atomic_t cmd_queue_empty;
 
 	/* Remember last sent ADDR_AB to the device */
 	uint32_t last_issued_addr_ab;
@@ -106,7 +103,6 @@ struct monter_context {
 };
 
 struct monter_command {
-	uint32_t index;
 	uint32_t cmd;
 	struct list_head list_entry;
 };
@@ -118,98 +114,98 @@ struct monter_command {
  */
 
 /** Read ENABLE register */
-static inline uint32_t
+static __always_inline uint32_t
 __monter_reg_enable_read(struct monter_device_context *ctx)
 {
 	return ioread32(ctx->bar0 + MONTER_ENABLE);
 }
 
 /** Send @value to ENABLE register */
-static inline void
+static __always_inline void
 __monter_reg_enable_write(struct monter_device_context *ctx, uint32_t value)
 {
 	iowrite32(value, ctx->bar0 + MONTER_ENABLE);
 }
 
 /** Read STATUS register */
-static inline uint32_t
+static __always_inline uint32_t
 __monter_reg_status_read(struct monter_device_context *ctx)
 {
 	return ioread32(ctx->bar0 + MONTER_STATUS);
 }
 
 /** Read INTR register */
-static inline uint32_t
+static __always_inline uint32_t
 __monter_reg_intr_read(struct monter_device_context *ctx)
 {
 	return ioread32(ctx->bar0 + MONTER_INTR);
 }
 
 /** Send @value to INTR register */
-static inline void
+static __always_inline void
 __monter_reg_intr_write(struct monter_device_context *ctx, uint32_t value)
 {
 	iowrite32(value, ctx->bar0 + MONTER_INTR);
 }
 
 /** Send @value to INTR_ENABLE register */
-static inline void
+static __always_inline void
 __monter_reg_intr_enable_write(struct monter_device_context *ctx, uint32_t value)
 {
 	iowrite32(value, ctx->bar0 + MONTER_INTR_ENABLE);
 }
 
 /** Send @value to RESET register */
-static inline void
+static __always_inline void
 __monter_reg_reset_write(struct monter_device_context *ctx, uint32_t value)
 {
 	iowrite32(value, ctx->bar0 + MONTER_RESET);
 }
 
 /** Send @value to FIFO_SEND register */
-static inline void
+static __always_inline void
 __monter_reg_fifo_send_write(struct monter_device_context *ctx, uint32_t value)
 {
 	iowrite32(value, ctx->bar0 + MONTER_FIFO_SEND);
 }
 
 /** Read FIFO_FREE register */
-static inline uint32_t
+static __always_inline uint32_t
 __monter_reg_fifo_free_read(struct monter_device_context *ctx)
 {
 	return ioread32(ctx->bar0 + MONTER_FIFO_FREE);
 }
 
 /** Read COUNTER register */
-static inline uint32_t
+static __always_inline uint32_t
 __monter_reg_counter_read(struct monter_device_context *ctx)
 {
 	return ioread32(ctx->bar0 + MONTER_COUNTER);
 }
 
 /** Read CMD_READ_PTR register */
-static inline uint32_t
+static __always_inline uint32_t
 __monter_reg_cmd_read_ptr_read(struct monter_device_context *ctx)
 {
 	return ioread32(ctx->bar0 + MONTER_CMD_READ_PTR);
 }
 
-/** Send value to CMD_READ_PTR register */
-static inline void
+/** Send @value to CMD_READ_PTR register */
+static __always_inline void
 __monter_reg_cmd_read_ptr_write(struct monter_device_context *ctx, uint32_t value)
 {
 	iowrite32(value, ctx->bar0 + MONTER_CMD_READ_PTR);
 }
 
 /** Read CMD_WRITE_PTR register */
-static inline uint32_t
+static __always_inline uint32_t
 __monter_reg_cmd_write_ptr_read(struct monter_device_context *ctx)
 {
 	return ioread32(ctx->bar0 + MONTER_CMD_WRITE_PTR);
 }
 
-/** Send value to CMD_WRITE_PTR register */
-static inline void
+/** Send @value to CMD_WRITE_PTR register */
+static __always_inline void
 __monter_reg_cmd_write_ptr_write(struct monter_device_context *ctx, uint32_t value)
 {
 	iowrite32(value, ctx->bar0 + MONTER_CMD_WRITE_PTR);

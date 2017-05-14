@@ -1,0 +1,41 @@
+# Zaawansowane Systemy Operacyjne
+
+rok akademicki 2016/2017
+
+Zadanie 2: Sterownik urządzenia Monter
+Autor rozwiązania: Dariusz Sosnowski <ds384373@students.mimuw.edu.pl>
+
+Sterownik będący rozwiązaniem zadania służy do obsługi urządzenia Monter.
+Urządzenie Monter jest wykorzystywane do mnożenia modularnego dużych liczb reprezentowanych
+w postaci Montgomery.
+
+Sterownik wspiera wiele kontekstów wykonania oraz obsługę wielu urządzeń
+podłączonych jednocześnie. Polecenia wykonywane są asynchronicznie,
+a sterownik wykorzystuje mechanizm DMA do przesyłania poleceń do wykonania.
+
+## Opis rozwiązania
+
+Rozwiązanie używa Linux workqueue API do przetwarzania poleceń urządzenia Monter przesłanych
+przez użytkownika.
+
+W momencie wywołania `write()` na pliku urządzenia Monter, przesłany ciąg poleceń zostaje dodany
+do kolejki związanej z danym kontekstem. Operacja `write()` kończy swoje działanie wraz z momentem dodania
+poleceń do kolejki oraz zakolejkowania zadania `monter_work_handler()` do późniejszego wykonania.
+
+Zadania związane z jednym urządzeniem umieszczane są w wspólnej kolejce `dev_workqueue` znajdującej
+się w strukturze `monter_device_context`, która przechowuje informacje związane z jednym urządzeniem.
+
+Operacja `fsync()` dodaje polecenie COUNTER z wyzerowaną flagą NOTIFY. Po dodaniu tego polecenia
+do kolejki kontekstu, `fsync()` oczekuje na powiadomienie o opróżnieniu kolejki poleceń.
+
+W funkcji `monter_work_handler()` sterownik próbuje zdjąć jak najwięcej poleceń z kolejki danego kontekstu,
+ale nie więcej niż 128 wliczając w to potrzebne komendy PAGE oraz ostatnią komendę COUNTER z ustawioną flagą NOTIFY.
+Ostatnia komenda COUNTER wykorzystywana jest do sygnalizowania zakończenia przetwarzania aktualnego zestawu
+poleceń. Przygotowany zestaw poleceń jest umieszczany w buforze DMA i rejestr CMD_WRITE_PTR urządzenia jest
+ustawiany na odpowiedni adres, po czym `monter_work_handler()` oczekuje na wywołanie przerwania NOTIFY
+(zasygnalizowane to będzie zmianą wartości flagi `notify` w strukturze `monter_device_context`).
+Po wywołaniu tego przerwania `monter_work_handler()` kolejkuje się do ponownego wykonania.
+
+Jeżeli w kolejce nie ma poleceń juz na rozpoczęciu `monter_work_handler()` to zostaje wysłane powiadomienie
+o opróżnieniu kolejki poleceń co w efekcie budzi proces oczekujący w `fsync()`.
+
