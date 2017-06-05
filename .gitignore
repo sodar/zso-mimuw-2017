@@ -8,3 +8,5 @@
 *.a
 *.ko
 *.o
+
+provided/
