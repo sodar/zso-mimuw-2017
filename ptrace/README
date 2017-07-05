@@ -1,0 +1,75 @@
+# Zaawansowane Systemy Operacyjne
+
+rok akademicki 2016/2017
+
+Zadanie 3: modyfikacja jądra
+Autor rozwiązania: Dariusz Sosnowski <ds384373@students.mimuw.edu.pl>
+
+Celem zadania 3. było rozszerzenie syscalla `ptrace` o operację
+`PTRACE_RUN_SYSCALL`, która pozwala na wykonanie żądanego syscalla
+jako śledzony proces.
+
+Rozwiązanie zawarte w patchu (plik `ptrace-run-syscall.patch`) wspiera
+Linuxa w wersji 4.9.13 i działa na architekturze `x86_64`.
+
+
+## Opis rozwiązania
+
+Gdy proces śledzący używa `ptrace` z żądaniem `PTRACE_RUN_SYSCALL` wywoływana
+jest funkcja `ptrace_run_syscall()`. W tej funkcji parametry oraz numer żądanego
+syscalla są pobierane z przestrzeni użytkownika i zapisywane w `task_struct` procesu
+śledzonego. Następnie ustawiana jest na nim flaga `TIF_RUN_SYSCALL`, w
+`thread_info->flags`. Flaga `TIF_RUN_SYSCALL` oznacza, że zostało zgłoszone żądanie
+wykonania syscalla jako dany proces. Po ustawieniu tej flagi proces śledzony jest
+budzony, a proces ślędzący czeka na kolejce `rs_waitq` zlokalizowanej w `task_struct`
+procesu śledzącego.
+
+W procesie śledzonym flaga `TIF_RUN_SYSCALL` sprawdzana jest w momencie przechodzenia do
+do przestrzeni użytkownika. Ma to miejsce w funkcji `exit_to_usermode_loop()`,
+zlokalizowanej w pliku `arch/x86/entry/common.c`. Jeżeli flaga żądania syscalla jest
+ustawiona, to wywoływana jest funkcja `do_ptrace_run_syscall`. Odpowiedni syscall
+znajdowany jest na podstawie numeru przekazanego jako parametr do ptrace (pole
+`rs_nr` w `task_struct`), w tablicy `sys_call_table`. Znaleziony syscall (a raczej
+wskaźnik na funkcję go implementującą) jest wywoływany, a jego wywołanie otoczone zawołaniami
+do `audit_syscall_entry` i `audit_syscall_exit`.
+
+Po zakończeniu wywołania syscalla, jego wynik oraz informacja o zapisaniu wyniku
+(potrzebna do poprawnego obudzenia procesu śledzącego) jest zapisywana w `task_struct`
+procesu śledzącego (odpowiednio - pola `rs_res` i `rs_res_stored`).
+Ponadto czyszczona jest flaga `TIF_RUN_SYSCALL`. Proces śledzący jest budzony, stan
+procesu śledzonego jest ustawiany na `TASK_TRACED`, po czym jest on usypiany za
+pomocą `freezable_schedule()`.
+
+Po wybudzeniu proces śledzący odczytuje zapisany wynik i przekazuje go do przestrzeni
+użytkownika.
+
+
+### Obsługa śmierci procesu śledzonego i zawieszenia procesu podczas wykonywania syscalla
+
+W celu poprawnej obsługi śmierci procesu śledzonego, oczekiwanie na `rs_waitq` w procesie
+śledzącym wykonywane jest przy użyciu `wait_event_timeout` z timeoutem w wysokości 10 ms.
+Jeżeli proces śledzący został obudzony ze względu na przekroczony timeout, sprawdzany
+jest `exit_state` procesu śledzonego. Jeżeli proces śledzony został zabity, to obsługa
+`PTRACE_RUN_SYSCALL` jest kończona z wynikiem 1.
+
+W przypadku gdy po przekroczeniu timeoutu proces śledzony dalej żyje oraz wynik jeszcze
+nie został zapisany, sprawdzana jest flaga `TIF_RUN_SYSCALL`. Jeżeli jest ona dalej ustawiona,
+to proces śledzony jest w trakcie wykonywania syscalla. W takim wypadku podejmowana jest próba
+wznowienia działania procesu, ale tylko i wyłącznie gdy proces śledzony jest w stanie
+`TASK_TRACED` (ta sytuacja ma miejsce na przykład przy syscallu `fork`).
+
+
+### Zapewnienie poprawnej obsługi sygnałów przez proces śledzony
+
+Aby zapewnić poprawną obsługę sygnałów przez proces śledzony,  po wywołaniu `freezable_schedule()`
+w `do_ptrace_run_syscall()` wywoływane są funkcje służące do przeliczenia flagi sigpending.
+Dzięki temu w dalszych iteracjach pętli w `exit_to_usermode_loop`, proces śledzony będzie
+miał szansę na obsługę zakolejkowanych sygnałów.
+
+
+### Wymóg aby proces śledzony był wstrzymany w trakcie PTRACE_RUN_SYSCALL
+
+Przy żądaniu `PTRACE_RUN_SYSCALL` śledzenie procesu oraz jego zatrzymanie jest zapewnione
+przez istniejące mechanizmy w obsłudze syscalla ptrace. Dokładniej mowa tu o funkcji
+`ptrace_check_attach()`, która jest wywoływana przy każdym żądaniu ptrace.
+

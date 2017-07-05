@@ -1,0 +1,275 @@
+diff --git a/arch/x86/entry/common.c b/arch/x86/entry/common.c
+index bdd9cc59d20f..556bf2461ebe 100644
+--- a/arch/x86/entry/common.c
++++ b/arch/x86/entry/common.c
+@@ -129,7 +129,7 @@ static long syscall_trace_enter(struct pt_regs *regs)
+ 
+ #define EXIT_TO_USERMODE_LOOP_FLAGS				\
+ 	(_TIF_SIGPENDING | _TIF_NOTIFY_RESUME | _TIF_UPROBE |	\
+-	 _TIF_NEED_RESCHED | _TIF_USER_RETURN_NOTIFY)
++	 _TIF_NEED_RESCHED | _TIF_USER_RETURN_NOTIFY | _TIF_RUN_SYSCALL)
+ 
+ static void exit_to_usermode_loop(struct pt_regs *regs, u32 cached_flags)
+ {
+@@ -163,6 +163,9 @@ static void exit_to_usermode_loop(struct pt_regs *regs, u32 cached_flags)
+ 		if (cached_flags & _TIF_USER_RETURN_NOTIFY)
+ 			fire_user_return_notifiers();
+ 
++		if (cached_flags & _TIF_RUN_SYSCALL)
++			do_ptrace_run_syscall();
++
+ 		/* Disable IRQs and retry */
+ 		local_irq_disable();
+ 
+diff --git a/arch/x86/include/asm/thread_info.h b/arch/x86/include/asm/thread_info.h
+index ad6f5eb07a95..9b1cf4ea4312 100644
+--- a/arch/x86/include/asm/thread_info.h
++++ b/arch/x86/include/asm/thread_info.h
+@@ -99,6 +99,7 @@ struct thread_info {
+ #define TIF_SYSCALL_TRACEPOINT	28	/* syscall tracepoint instrumentation */
+ #define TIF_ADDR32		29	/* 32-bit address space on 64 bits */
+ #define TIF_X32			30	/* 32-bit native x86-64 binary */
++#define TIF_RUN_SYSCALL		31	/* ptrace run syscall active */
+ 
+ #define _TIF_SYSCALL_TRACE	(1 << TIF_SYSCALL_TRACE)
+ #define _TIF_NOTIFY_RESUME	(1 << TIF_NOTIFY_RESUME)
+@@ -121,6 +122,7 @@ struct thread_info {
+ #define _TIF_SYSCALL_TRACEPOINT	(1 << TIF_SYSCALL_TRACEPOINT)
+ #define _TIF_ADDR32		(1 << TIF_ADDR32)
+ #define _TIF_X32		(1 << TIF_X32)
++#define _TIF_RUN_SYSCALL	(1 << TIF_RUN_SYSCALL)
+ 
+ /*
+  * work to do in syscall_trace_enter().  Also includes TIF_NOHZ for
+diff --git a/include/linux/ptrace.h b/include/linux/ptrace.h
+index e0e539321ab9..3bb721c36d55 100644
+--- a/include/linux/ptrace.h
++++ b/include/linux/ptrace.h
+@@ -408,4 +408,7 @@ extern int task_current_syscall(struct task_struct *target, long *callno,
+ 				unsigned long args[6], unsigned int maxargs,
+ 				unsigned long *sp, unsigned long *pc);
+ 
++/* Used right before exit to usermode to run the requested syscall */
++extern void do_ptrace_run_syscall(void);
++
+ #endif
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index 75d9a57e212e..50ad91a1f11a 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -1486,6 +1486,16 @@ struct task_struct {
+ 	unsigned int flags;	/* per process flags, defined below */
+ 	unsigned int ptrace;
+ 
++	/* Fields used in PTRACE_RUN_SYSCALL - stored in tracee */
++	struct task_struct *rs_tracer;
++	int rs_nr;
++	uint64_t rs_args[6];
++
++	/* Fields used in PTRACE_RUN_SYSCALL - stored in tracer */
++	int rs_res_stored;
++	uint64_t rs_res;
++	wait_queue_head_t rs_waitq;
++
+ #ifdef CONFIG_SMP
+ 	struct llist_node wake_entry;
+ 	int on_cpu;
+diff --git a/include/uapi/linux/ptrace.h b/include/uapi/linux/ptrace.h
+index fb8106509000..fdf2f76c41fa 100644
+--- a/include/uapi/linux/ptrace.h
++++ b/include/uapi/linux/ptrace.h
+@@ -23,6 +23,15 @@
+ 
+ #define PTRACE_SYSCALL		  24
+ 
++#define PTRACE_RUN_SYSCALL	  42
++
++struct ptrace_run_syscall_args {
++	int nr;
++	uint32_t arch;
++	uint64_t args[6];
++	uint64_t res;
++};
++
+ /* 0x4200-0x4300 are reserved for architecture-independent additions.  */
+ #define PTRACE_SETOPTIONS	0x4200
+ #define PTRACE_GETEVENTMSG	0x4201
+diff --git a/kernel/fork.c b/kernel/fork.c
+index ba8a01564985..7ccb139b75a5 100644
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -1706,6 +1706,16 @@ static __latent_entropy struct task_struct *copy_process(
+ #endif
+ 	clear_all_latency_tracing(p);
+ 
++	clear_tsk_thread_flag(p, TIF_RUN_SYSCALL);
++
++	p->rs_tracer = NULL;
++	p->rs_nr = 0;
++	memset(p->rs_args, 0, sizeof(p->rs_args));
++
++	p->rs_res_stored = 0;
++	p->rs_res = 0;
++	init_waitqueue_head(&p->rs_waitq);
++
+ 	/* ok, now we should be set up.. */
+ 	p->pid = pid_nr(pid);
+ 	if (clone_flags & CLONE_THREAD) {
+diff --git a/kernel/ptrace.c b/kernel/ptrace.c
+index 49ba7c1ade9d..6fe298ccadf0 100644
+--- a/kernel/ptrace.c
++++ b/kernel/ptrace.c
+@@ -26,6 +26,9 @@
+ #include <linux/hw_breakpoint.h>
+ #include <linux/cn_proc.h>
+ #include <linux/compat.h>
++#include <linux/wait.h>
++#include <linux/jiffies.h>
++#include <linux/freezer.h>
+ 
+ /*
+  * Access another process' address space via ptrace.
+@@ -867,6 +870,133 @@ static int ptrace_regset(struct task_struct *task, int req, unsigned int type,
+ EXPORT_SYMBOL_GPL(task_user_regset_view);
+ #endif
+ 
++void do_ptrace_run_syscall(void)
++{
++	struct task_struct *task = current;
++	struct task_struct *tracer;
++	int nr;
++	int filtered_nr;
++	uint64_t args[6];
++	struct pt_regs pt_regs = { 0 };
++	long sys_call_res;
++	unsigned long flags;
++
++	BUG_ON(!test_tsk_thread_flag(task, TIF_RUN_SYSCALL));
++
++	tracer = task->rs_tracer;
++	nr = task->rs_nr;
++	memcpy(args, task->rs_args, sizeof(task->rs_args));
++
++	BUG_ON(tracer == NULL);
++
++	filtered_nr = nr & __SYSCALL_MASK;
++	if (filtered_nr < NR_syscalls) {
++		pt_regs.orig_ax = filtered_nr;
++		pt_regs.di  = args[0];
++		pt_regs.si  = args[1];
++		pt_regs.dx  = args[2];
++		pt_regs.r10 = args[3];
++		pt_regs.r8  = args[4];
++		pt_regs.r9  = args[5];
++
++		audit_syscall_entry(filtered_nr, args[0], args[1], args[2], args[3]);
++		sys_call_res = sys_call_table[filtered_nr](
++			args[0], args[1], args[2],
++			args[3], args[4], args[5]);
++		pt_regs.ax = sys_call_res;
++		audit_syscall_exit(&pt_regs);
++	} else {
++		sys_call_res = -ENOSYS;
++	}
++
++	clear_tsk_thread_flag(task, TIF_RUN_SYSCALL);
++	tracer->rs_res_stored = 1;
++	tracer->rs_res = sys_call_res;
++
++	/* syscall returned, result is stored - now we must go to sleep,
++	   but first wake the tracer */
++	wake_up(&tracer->rs_waitq);
++
++	/* Now go to sleep */
++	set_current_state(TASK_TRACED);
++	freezable_schedule();
++
++	/* Tracee is back - need to recalculate sigpending */
++	spin_lock_irqsave(&current->sighand->siglock, flags);
++	recalc_sigpending();
++	spin_unlock_irqrestore(&current->sighand->siglock, flags);
++}
++
++static int ptrace_run_syscall(struct task_struct *child,
++			      long request,
++			      unsigned long addr,
++			      unsigned long data)
++{
++	void __user *data_ptr = (void __user *)data;
++	void __user *res_ptr = data_ptr + offsetof(struct ptrace_run_syscall_args, res);
++	struct ptrace_run_syscall_args syscall_args = { 0 };
++	unsigned long wait_timeout;
++	int wait_ret;
++	int ret = 0;
++
++	if (copy_from_user(&syscall_args, data_ptr, sizeof syscall_args)) {
++		ret = -EFAULT;
++		goto exit;
++	}
++
++	if (syscall_args.arch != AUDIT_ARCH_X86_64) {
++		ret = -EINVAL;
++		goto exit;
++	}
++
++	/* Initialize syscall request */
++	child->rs_tracer = current;
++	child->rs_nr = syscall_args.nr;
++	memcpy(child->rs_args, syscall_args.args, sizeof(syscall_args.args));
++
++	/* Initialize syscall result store */
++	current->rs_res_stored = 0;
++	current->rs_res = syscall_args.res;
++
++	set_tsk_thread_flag(child, TIF_RUN_SYSCALL);
++	wake_up_state(child, __TASK_TRACED);
++
++	wait_timeout = HZ / 100; /* 10 ms */
++	do {
++		wait_ret = wait_event_timeout(
++			current->rs_waitq,
++			current->rs_res_stored,
++			wait_timeout);
++		if (wait_ret)
++			break;
++		/* If child died during syscall, we cannot read return value */
++		if (child->exit_state) {
++			ret = 1;
++			goto exit;
++		}
++		/* If syscall did not finish yet (might be stopped in the fork),
++		   then wake it, so it can clear TIF_RUN_SYSCALL and stop there. */
++		if (test_tsk_thread_flag(child, TIF_RUN_SYSCALL)) {
++			wake_up_state(child, __TASK_TRACED);
++		}
++	} while (true);
++
++	wait_task_inactive(child, 0);
++
++	syscall_args.res = current->rs_res;
++	if (syscall_args.res == -ENOSYS) {
++		ret = -ENOSYS;
++		goto exit;
++	}
++
++	if (copy_to_user(res_ptr, &syscall_args.res, sizeof(syscall_args.res))) {
++		ret = -EFAULT;
++	}
++
++exit:
++	return ret;
++}
++
+ int ptrace_request(struct task_struct *child, long request,
+ 		   unsigned long addr, unsigned long data)
+ {
+@@ -1079,6 +1209,9 @@ int ptrace_request(struct task_struct *child, long request,
+ 		ret = seccomp_get_filter(child, addr, datavp);
+ 		break;
+ 
++	case PTRACE_RUN_SYSCALL:
++		return ptrace_run_syscall(child, request, addr, data);
++
+ 	default:
+ 		break;
+ 	}
